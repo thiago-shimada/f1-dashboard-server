@@ -42,8 +42,8 @@ app.post('/login', async (req, res) => {
   try {
     const client = await pool.connect();
     
-    // Call the PostgreSQL function Autentica_Usuario
-    const functionQuery = 'SELECT * FROM Autentica_Usuario($1, $2)';
+    // Call the PostgreSQL function AutenticaUsuario
+    const functionQuery = 'SELECT * FROM AutenticaUsuario($1, $2)';
     const result = await client.query(functionQuery, [username, password]);
     
     client.release();
@@ -723,6 +723,353 @@ app.post('/api/upload-drivers', upload.single('file'), async (req, res) => {
     }
     
     res.status(500).json({ message: 'Failed to process file.' });
+  }
+});
+
+// Reports endpoints
+app.get('/api/reports', async (req, res) => {
+  if (!req.session.user || !req.session.user.dbConfig) {
+    return res.status(401).json({ message: 'Unauthorized: No active session or database configuration missing.' });
+  }
+  
+  const userRole = req.session.user.role;
+  let reports = [];
+  
+  if (userRole === 'admin' || userRole === 'Administrador') {
+    reports = [
+      {
+        id: 'report1',
+        name: 'Relatório 1: Status de Resultados',
+        description: 'Quantidade de resultados por status',
+        requiresParams: false,
+        query: `
+          SELECT
+              s.status,
+              COALESCE(r.quantidade, 0) AS quantidade
+          FROM
+              status s
+          LEFT JOIN (
+              SELECT statusid, COUNT(DISTINCT resultid) AS quantidade
+              FROM results
+              GROUP BY statusid
+          ) r ON s.statusid = r.statusid
+          ORDER BY 2 DESC;
+        `
+      },
+      {
+        id: 'report2',
+        name: 'Relatório 2: Aeroportos Próximos às Cidades',
+        description: 'Aeroportos médios e grandes no Brasil próximos às cidades',
+        requiresParams: false,
+        query: `
+          SELECT 
+              c.name AS cidade,
+              a.name AS aeroporto,
+              a.city AS cidade_aeroporto,
+              earth_distance(
+                  ll_to_earth(a.latdeg, a.longdeg),
+                  ll_to_earth(c.lat, c.long)
+              ) / 1000 AS distancia,
+              a.type AS tipo
+          FROM airports a
+          JOIN geocities15k c
+            ON earth_box(ll_to_earth(a.latdeg, a.longdeg), 100000) @> ll_to_earth(c.lat, c.long)
+               AND earth_distance(
+                   ll_to_earth(a.latdeg, a.longdeg),
+                   ll_to_earth(c.lat, c.long)
+               ) <= 100000
+          WHERE
+            a.type IN ('medium_airport', 'large_airport')
+            AND a.isocountry = 'BR'
+          ORDER BY 2, 4;
+        `
+      },
+      {
+        id: 'report3a',
+        name: 'Relatório 3A: Quantidade de Pilotos por Escuderia',
+        description: 'Número de pilotos diferentes que correram por cada escuderia',
+        requiresParams: false,
+        query: `
+          WITH counter AS (
+              SELECT 
+                  constructorid,
+                  COUNT(DISTINCT driverid) as driver_count
+              FROM results
+              GROUP BY constructorid
+          )
+          SELECT 
+              c.name AS Escuderia,
+              COALESCE(co.driver_count, 0) as Pilotos
+          FROM constructors c
+          LEFT JOIN counter co ON c.constructorid = co.constructorid
+          ORDER BY 2 DESC, 1;
+        `
+      },
+      {
+        id: 'report3b',
+        name: 'Relatório 3B: Quantidade de Corridas por Escuderia',
+        description: 'Número de corridas por escuderia',
+        requiresParams: false,
+        query: `
+          SELECT 
+              c.name,
+              COALESCE(corridas.corrida, 0) as corridas
+          FROM constructors c
+          LEFT JOIN (
+              SELECT 
+                  constructorid,
+                  COUNT(DISTINCT raceid) as corrida
+              FROM results
+              GROUP BY constructorid
+          ) corridas ON c.constructorid = corridas.constructorid
+          ORDER BY 2 DESC, 1;
+        `
+      },
+      {
+        id: 'report3c',
+        name: 'Relatório 3C: Corridas por Circuito por Escuderia',
+        description: 'Estatísticas de voltas por escuderia e circuito',
+        requiresParams: false,
+        query: `
+          SELECT 
+            c.name, 
+            c2.name, 
+            COUNT(DISTINCT r.raceid) AS quantidade_corridas, 
+            MIN(r.laps) AS minimo_voltas, 
+            MAX(r.laps) AS maximo_voltas, 
+            ROUND(AVG(r.laps), 2) AS media_voltas
+          FROM constructors c 
+          JOIN results r ON r.constructorid = c.constructorid
+          JOIN races r2 ON r2.raceid = r.raceid 
+          JOIN circuits c2 ON c2.circuitid = r2.circuitid
+          GROUP BY 1, 2
+          ORDER BY 1, 3 DESC;
+        `
+      },
+      {
+        id: 'report3d',
+        name: 'Relatório 3D: Tempo e Voltas por Corrida por Escuderia',
+        description: 'Total de tempo e voltas por corrida por escuderia',
+        requiresParams: false,
+        query: `
+          SELECT
+            c.name,
+            c2.name,
+            r2.year,
+            SUM(r.laps) AS total_voltas,
+            (SUM(r.milliseconds)||' milliseconds')::INTERVAL AS total_tempo
+          FROM constructors c
+          JOIN results r ON r.constructorid = c.constructorid
+          JOIN races r2 ON r2.raceid = r.raceid
+          JOIN circuits c2 ON c2.circuitid = r2.circuitid
+          WHERE r.milliseconds IS NOT NULL
+          GROUP BY 1, 2, 3
+          ORDER BY 1, 2, 3;
+        `
+      }
+    ];
+  } else if (userRole === 'escuderia' || userRole === 'Escuderia') {
+    reports = [
+      {
+        id: 'report4',
+        name: 'Relatório 4: Vitórias por Piloto da Escuderia',
+        description: 'Vitórias de cada piloto da sua escuderia',
+        requiresParams: false,
+        isFunction: true,
+        functionName: 'PilotosVitoriasEscuderia'
+      },
+      {
+        id: 'report5',
+        name: 'Relatório 5: Status de Resultados da Escuderia',
+        description: 'Status dos resultados da sua escuderia',
+        requiresParams: false,
+        isFunction: true,
+        functionName: 'StatusEscuderia'
+      }
+    ];
+  } else if (userRole === 'piloto' || userRole === 'Piloto') {
+    reports = [
+      {
+        id: 'report6',
+        name: 'Relatório 6: Pontos por Corrida',
+        description: 'Seus pontos por corrida e ano',
+        requiresParams: false,
+        isFunction: true,
+        functionName: 'PontosPiloto'
+      },
+      {
+        id: 'report7',
+        name: 'Relatório 7: Status dos Seus Resultados',
+        description: 'Status dos seus resultados nas corridas',
+        requiresParams: false,
+        isFunction: true,
+        functionName: 'StatusPiloto'
+      }
+    ];
+  }
+  
+  res.json({
+    userRole: userRole,
+    reports: reports
+  });
+});
+
+app.post('/api/reports/execute', async (req, res) => {
+  if (!req.session.user || !req.session.user.dbConfig) {
+    return res.status(401).json({ message: 'Unauthorized: No active session or database configuration missing.' });
+  }
+  
+  const { reportId, params } = req.body;
+  const userRole = req.session.user.role;
+  const pool = new Pool(req.session.user.dbConfig);
+  
+  try {
+    const client = await pool.connect();
+    let result;
+    
+    // Define report queries based on role and reportId
+    if (userRole === 'admin' || userRole === 'Administrador') {
+      const adminReports = {
+        'report1': `
+          SELECT
+              s.status,
+              COALESCE(r.quantidade, 0) AS quantidade
+          FROM
+              status s
+          LEFT JOIN (
+              SELECT statusid, COUNT(DISTINCT resultid) AS quantidade
+              FROM results
+              GROUP BY statusid
+          ) r ON s.statusid = r.statusid
+          ORDER BY 2 DESC;
+        `,
+        'report2': `
+          SELECT 
+              c.name AS cidade,
+              a.name AS aeroporto,
+              a.city AS cidade_aeroporto,
+              earth_distance(
+                  ll_to_earth(a.latdeg, a.longdeg),
+                  ll_to_earth(c.lat, c.long)
+              ) / 1000 AS distancia,
+              a.type AS tipo
+          FROM airports a
+          JOIN geocities15k c
+            ON earth_box(ll_to_earth(a.latdeg, a.longdeg), 100000) @> ll_to_earth(c.lat, c.long)
+               AND earth_distance(
+                   ll_to_earth(a.latdeg, a.longdeg),
+                   ll_to_earth(c.lat, c.long)
+               ) <= 100000
+          WHERE
+            a.type IN ('medium_airport', 'large_airport')
+            AND a.isocountry = 'BR'
+          ORDER BY 2, 4;
+        `,
+        'report3a': `
+          WITH counter AS (
+              SELECT 
+                  constructorid,
+                  COUNT(DISTINCT driverid) as driver_count
+              FROM results
+              GROUP BY constructorid
+          )
+          SELECT 
+              c.name AS Escuderia,
+              COALESCE(co.driver_count, 0) as Pilotos
+          FROM constructors c
+          LEFT JOIN counter co ON c.constructorid = co.constructorid
+          ORDER BY 2 DESC, 1;
+        `,
+        'report3b': `
+          SELECT 
+              c.name AS escuderia,
+              COALESCE(corridas.corrida, 0) as corridas
+          FROM constructors c
+          LEFT JOIN (
+              SELECT 
+                  constructorid,
+                  COUNT(DISTINCT raceid) as corrida
+              FROM results
+              GROUP BY constructorid
+          ) corridas ON c.constructorid = corridas.constructorid
+          ORDER BY 2 DESC, 1;
+        `,
+        'report3c': `
+          SELECT 
+            c.name AS escuderia, 
+            c2.name AS circuito, 
+            COUNT(DISTINCT r.raceid) AS quantidade_corridas, 
+            MIN(r.laps) AS minimo_voltas, 
+            MAX(r.laps) AS maximo_voltas, 
+            ROUND(AVG(r.laps), 2) AS media_voltas
+          FROM constructors c 
+          JOIN results r ON r.constructorid = c.constructorid
+          JOIN races r2 ON r2.raceid = r.raceid 
+          JOIN circuits c2 ON c2.circuitid = r2.circuitid
+          GROUP BY 1, 2
+          ORDER BY 1, 3 DESC;
+        `,
+        'report3d': `
+          SELECT
+            c.name AS escuderia,
+            c2.name AS circuito,
+            r2.year AS ano,
+            SUM(r.laps) AS total_voltas,
+            (SUM(r.milliseconds)||' milliseconds')::INTERVAL AS total_tempo
+          FROM constructors c
+          JOIN results r ON r.constructorid = c.constructorid
+          JOIN races r2 ON r2.raceid = r.raceid
+          JOIN circuits c2 ON c2.circuitid = r2.circuitid
+          WHERE r.milliseconds IS NOT NULL
+          GROUP BY 1, 2, 3
+          ORDER BY 1, 2, 3;
+        `
+      };
+      
+      const query = adminReports[reportId];
+      if (!query) {
+        return res.status(404).json({ message: 'Report not found.' });
+      }
+      
+      result = await client.query(query);
+      
+    } else if (userRole === 'escuderia' || userRole === 'Escuderia') {
+      const constructorId = req.session.user.idOriginal;
+      
+      if (reportId === 'report4') {
+        result = await client.query('SELECT * FROM PilotosVitoriasEscuderia($1)', [constructorId]);
+      } else if (reportId === 'report5') {
+        result = await client.query('SELECT * FROM StatusEscuderia($1)', [constructorId]);
+      } else {
+        return res.status(404).json({ message: 'Report not found.' });
+      }
+      
+    } else if (userRole === 'piloto' || userRole === 'Piloto') {
+      const driverId = req.session.user.idOriginal;
+      
+      if (reportId === 'report6') {
+        result = await client.query('SELECT * FROM PontosPiloto($1)', [driverId]);
+      } else if (reportId === 'report7') {
+        result = await client.query('SELECT * FROM StatusPiloto($1)', [driverId]);
+      } else {
+        return res.status(404).json({ message: 'Report not found.' });
+      }
+      
+    } else {
+      return res.status(403).json({ message: 'Access denied: Invalid user role.' });
+    }
+    
+    client.release();
+    
+    res.json({
+      data: result.rows,
+      columns: result.fields.map(field => field.name),
+      count: result.rows.length
+    });
+    
+  } catch (error) {
+    console.error('Error executing report:', error);
+    res.status(500).json({ message: 'Failed to execute report.', error: error.message });
   }
 });
 
