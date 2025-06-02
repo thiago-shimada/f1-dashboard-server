@@ -1,5 +1,7 @@
+const { pipeline } = require('node:stream/promises');
 const express = require('express');
 const { Pool } = require('pg');
+const copyFrom = require('pg-copy-streams').from;
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
@@ -472,8 +474,8 @@ app.post('/api/drivers', async (req, res) => {
     const client = await pool.connect();
     
     const insertQuery = `
-      INSERT INTO Driver (driverid, driverref, number, code, forename, surname, dob, nationality, url)
-      VALUES ((SELECT COALESCE(MAX(driverid), 0) + 1 FROM driver), $1, $2, $3, $4, $5, $6, $7, NULL)
+      INSERT INTO Driver (driverref, number, code, forename, surname, dob, nationality, url)
+      VALUES ((SELECT COALESCE($1, $2, $3, $4, $5, $6, $7, NULL)
     `;
     
     const result = await client.query(insertQuery, [driverRef, parseInt(number), code, forename, surname, dob, nationality]);
@@ -518,8 +520,8 @@ app.post('/api/constructors', async (req, res) => {
     const client = await pool.connect();
     
     const insertQuery = `
-      INSERT INTO Constructors (constructorid, constructorref, name, nationality, url)
-      VALUES ((SELECT COALESCE(MAX(constructorid), 0) + 1 FROM constructors), $1, $2, $3, $4)
+      INSERT INTO Constructors (constructorref, name, nationality, url)
+      VALUES ($1, $2, $3, $4)
     `;
     
     const result = await client.query(insertQuery, [constructorRef, name, nationality, url]);
@@ -622,96 +624,49 @@ app.post('/api/upload-drivers', upload.single('file'), async (req, res) => {
   let insertedCount = 0;
   let errors = [];
 
+
   try {
     const client = await pool.connect();
     const filePath = req.file.path;
     const fileName = req.file.originalname.toLowerCase();
-    
-    let drivers = [];
+    console.log(`Processing file: ${fileName} in path: ${filePath}`);
 
-    // Parse file based on extension
-    if (fileName.endsWith('.csv')) {
-      // Parse CSV file
-      drivers = await new Promise((resolve, reject) => {
-        const results = [];
-        fs.createReadStream(filePath)
-          .pipe(csv())
-          .on('data', (data) => results.push(data))
-          .on('end', () => resolve(results))
-          .on('error', reject);
+    // Check if file is CSV format
+    if (!fileName.endsWith('.csv')) {
+      fs.unlinkSync(filePath);
+      return res.status(400).json({ 
+        message: 'Unsupported file format. Please use CSV files with the format: driverref,code,forename,surname,dob,nationality,number,url' 
       });
-    } else if (fileName.endsWith('.xlsx') || fileName.endsWith('.xls')) {
-      // Parse Excel file
-      const workbook = new ExcelJS.Workbook();
-      await workbook.xlsx.readFile(filePath);
-      const worksheet = workbook.getWorksheet(1);
-      const headers = [];
-      
-      // Get headers from first row
-      worksheet.getRow(1).eachCell((cell, colNumber) => {
-        headers[colNumber] = cell.value;
-      });
-      
-      // Get data rows
-      worksheet.eachRow((row, rowNumber) => {
-        if (rowNumber > 1) { // Skip header row
-          const driver = {};
-          row.eachCell((cell, colNumber) => {
-            if (headers[colNumber]) {
-              driver[headers[colNumber]] = cell.value;
-            }
-          });
-          drivers.push(driver);
-        }
-      });
-    } else {
-      return res.status(400).json({ message: 'Unsupported file format. Please use CSV or Excel files.' });
     }
 
-    // Insert drivers into database
-    for (const driver of drivers) {
-      try {
-        // Map common field names (case insensitive)
-        const driverRef = driver.driverref || driver.driverRef || driver.driver_ref || driver['Driver Ref'];
-        const number = driver.number || driver.Number || driver.num;
-        const code = driver.code || driver.Code || driver.driver_code;
-        const forename = driver.forename || driver.Forename || driver.firstname || driver['First Name'];
-        const surname = driver.surname || driver.Surname || driver.lastname || driver['Last Name'];
-        const dob = driver.dob || driver.DOB || driver.dateofbirth || driver['Date of Birth'];
-        const nationality = driver.nationality || driver.Nationality || driver.country;
-
-        if (!driverRef || !number || !code || !forename || !surname || !dob || !nationality) {
-          errors.push(`Row skipped: Missing required fields for driver ${forename} ${surname}`);
-          continue;
-        }
-
-        const insertQuery = `
-          INSERT INTO Driver (driverref, number, code, forename, surname, dob, nationality)
-          VALUES ($1, $2, $3, $4, $5, $6, $7)
-        `;
-        
-        await client.query(insertQuery, [driverRef, parseInt(number), code, forename, surname, dob, nationality]);
-        insertedCount++;
-        
-      } catch (error) {
-        if (error.code === '23505') { // Unique violation
-          errors.push(`Driver ${driver.forename} ${driver.surname} already exists`);
-        } else {
-          errors.push(`Error inserting driver ${driver.forename} ${driver.surname}: ${error.message}`);
-        }
-      }
-    }
+    // Count lines in file to estimate records processed
+    const fileContent = fs.readFileSync(filePath, 'utf8');
+    const lineCount = fileContent.split('\n').filter(line => line.trim()).length;
     
+    // Get record count before insertion
+    const beforeCountResult = await client.query('SELECT COUNT(*) as count FROM Driver');
+    const beforeCount = parseInt(beforeCountResult.rows[0].count);
+
+    // Use streaming COPY for efficient bulk insert
+    const ingestStream = client.query(copyFrom('COPY Driver(driverref, code, forename, surname, dob, nationality, number, url) FROM STDIN WITH (FORMAT csv, HEADER false)'));
+    const sourceStream = fs.createReadStream(filePath);
+    await pipeline(sourceStream, ingestStream);
+
+    // Get record count after insertion to calculate actual inserted records
+    const afterCountResult = await client.query('SELECT COUNT(*) as count FROM Driver');
+    const afterCount = parseInt(afterCountResult.rows[0].count);
+    const actualInserted = afterCount - beforeCount;
+
     client.release();
-    
-    // Clean up uploaded file
     fs.unlinkSync(filePath);
     
     res.json({
-      message: 'File processed successfully',
-      inserted: insertedCount,
-      errors: errors,
-      totalRows: drivers.length
+      message: 'File processed successfully using streaming upload',
+      fileName: fileName,
+      estimatedRows: lineCount,
+      inserted: actualInserted,
+      skipped: lineCount - actualInserted,
+      uploadMethod: 'PostgreSQL COPY streaming'
     });
 
   } catch (error) {
@@ -722,7 +677,23 @@ app.post('/api/upload-drivers', upload.single('file'), async (req, res) => {
       fs.unlinkSync(req.file.path);
     }
     
-    res.status(500).json({ message: 'Failed to process file.' });
+    // Provide more specific error messages
+    if (error.code === '23505') {
+      res.status(409).json({ 
+        message: 'File processing failed due to duplicate records. Some drivers may already exist in the database.',
+        error: 'Unique constraint violation'
+      });
+    } else if (error.code === '22P04') {
+      res.status(400).json({ 
+        message: 'File processing failed due to invalid CSV format. Please check your file format.',
+        error: 'Invalid CSV format'
+      });
+    } else {
+      res.status(500).json({ 
+        message: 'Failed to process file due to server error.',
+        error: error.message 
+      });
+    }
   }
 });
 
@@ -743,17 +714,7 @@ app.get('/api/reports', async (req, res) => {
         description: 'Quantidade de resultados por status',
         requiresParams: false,
         query: `
-          SELECT
-              s.status,
-              COALESCE(r.quantidade, 0) AS quantidade
-          FROM
-              status s
-          LEFT JOIN (
-              SELECT statusid, COUNT(DISTINCT resultid) AS quantidade
-              FROM results
-              GROUP BY statusid
-          ) r ON s.statusid = r.statusid
-          ORDER BY 2 DESC;
+          SELECT * FROM report1;
         `
       },
       {
@@ -762,26 +723,7 @@ app.get('/api/reports', async (req, res) => {
         description: 'Aeroportos médios e grandes no Brasil próximos às cidades',
         requiresParams: false,
         query: `
-          SELECT 
-              c.name AS cidade,
-              a.name AS aeroporto,
-              a.city AS cidade_aeroporto,
-              earth_distance(
-                  ll_to_earth(a.latdeg, a.longdeg),
-                  ll_to_earth(c.lat, c.long)
-              ) / 1000 AS distancia,
-              a.type AS tipo
-          FROM airports a
-          JOIN geocities15k c
-            ON earth_box(ll_to_earth(a.latdeg, a.longdeg), 100000) @> ll_to_earth(c.lat, c.long)
-               AND earth_distance(
-                   ll_to_earth(a.latdeg, a.longdeg),
-                   ll_to_earth(c.lat, c.long)
-               ) <= 100000
-          WHERE
-            a.type IN ('medium_airport', 'large_airport')
-            AND a.isocountry = 'BR'
-          ORDER BY 2, 4;
+          SELECT * FROM report2;
         `
       },
       {
@@ -790,19 +732,7 @@ app.get('/api/reports', async (req, res) => {
         description: 'Número de pilotos diferentes que correram por cada escuderia',
         requiresParams: false,
         query: `
-          WITH counter AS (
-              SELECT 
-                  constructorid,
-                  COUNT(DISTINCT driverid) as driver_count
-              FROM results
-              GROUP BY constructorid
-          )
-          SELECT 
-              c.name AS Escuderia,
-              COALESCE(co.driver_count, 0) as Pilotos
-          FROM constructors c
-          LEFT JOIN counter co ON c.constructorid = co.constructorid
-          ORDER BY 2 DESC, 1;
+          SELECT * FROM report3a;
         `
       },
       {
@@ -811,18 +741,7 @@ app.get('/api/reports', async (req, res) => {
         description: 'Número de corridas por escuderia',
         requiresParams: false,
         query: `
-          SELECT 
-              c.name,
-              COALESCE(corridas.corrida, 0) as corridas
-          FROM constructors c
-          LEFT JOIN (
-              SELECT 
-                  constructorid,
-                  COUNT(DISTINCT raceid) as corrida
-              FROM results
-              GROUP BY constructorid
-          ) corridas ON c.constructorid = corridas.constructorid
-          ORDER BY 2 DESC, 1;
+          SELECT * FROM report3b;
         `
       },
       {
@@ -831,19 +750,7 @@ app.get('/api/reports', async (req, res) => {
         description: 'Estatísticas de voltas por escuderia e circuito',
         requiresParams: false,
         query: `
-          SELECT 
-            c.name, 
-            c2.name, 
-            COUNT(DISTINCT r.raceid) AS quantidade_corridas, 
-            MIN(r.laps) AS minimo_voltas, 
-            MAX(r.laps) AS maximo_voltas, 
-            ROUND(AVG(r.laps), 2) AS media_voltas
-          FROM constructors c 
-          JOIN results r ON r.constructorid = c.constructorid
-          JOIN races r2 ON r2.raceid = r.raceid 
-          JOIN circuits c2 ON c2.circuitid = r2.circuitid
-          GROUP BY 1, 2
-          ORDER BY 1, 3 DESC;
+          SELECT * FROM report3c;
         `
       },
       {
@@ -852,19 +759,7 @@ app.get('/api/reports', async (req, res) => {
         description: 'Total de tempo e voltas por corrida por escuderia',
         requiresParams: false,
         query: `
-          SELECT
-            c.name,
-            c2.name,
-            r2.year,
-            SUM(r.laps) AS total_voltas,
-            (SUM(r.milliseconds)||' milliseconds')::INTERVAL AS total_tempo
-          FROM constructors c
-          JOIN results r ON r.constructorid = c.constructorid
-          JOIN races r2 ON r2.raceid = r.raceid
-          JOIN circuits c2 ON c2.circuitid = r2.circuitid
-          WHERE r.milliseconds IS NOT NULL
-          GROUP BY 1, 2, 3
-          ORDER BY 1, 2, 3;
+          SELECT * FROM report3d;
         `
       }
     ];
