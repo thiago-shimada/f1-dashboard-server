@@ -221,43 +221,6 @@ app.get('/api/views', async (req, res) => {
   }
 });
 
-app.get('/api/drivers', async (req, res) => {
-  if (!req.session.user || !req.session.user.dbConfig) {
-    return res.status(401).json({ message: 'Unauthorized: No active session or database configuration missing.' });
-  }
-
-  const pool = new Pool(req.session.user.dbConfig); 
-
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 20;
-  const offset = (page - 1) * limit;
-
-  try {
-    const client = await pool.connect();
-    const totalResult = await client.query('SELECT COUNT(*) FROM Driver;');
-    const totalDrivers = parseInt(totalResult.rows[0].count);
-    
-    const queryText = `
-      SELECT *
-      FROM Driver 
-      ORDER BY COUNT(*) OVER (PARTITION BY nationality) DESC, nationality, forename, surname 
-      LIMIT $1 OFFSET $2;
-    `;
-    const result = await client.query(queryText, [limit, offset]);
-    client.release();
-    
-    res.json({
-      drivers: result.rows,
-      totalPages: Math.ceil(totalDrivers / limit),
-      currentPage: page,
-      totalDrivers: totalDrivers
-    });
-  } catch (error) {
-    console.error('Error fetching drivers:', error);
-    res.status(500).json({ message: 'Failed to fetch drivers.' });
-  }
-});
-
 // New endpoint for individual view with pagination
 app.get('/api/view/:viewName', async (req, res) => {
   console.log('Session data:', req.session);
@@ -475,7 +438,7 @@ app.post('/api/drivers', async (req, res) => {
     
     const insertQuery = `
       INSERT INTO Driver (driverref, number, code, forename, surname, dob, nationality, url)
-      VALUES ((SELECT COALESCE($1, $2, $3, $4, $5, $6, $7, NULL)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
     `;
     
     const result = await client.query(insertQuery, [driverRef, parseInt(number), code, forename, surname, dob, nationality]);
