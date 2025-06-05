@@ -2,7 +2,7 @@ const { pipeline } = require('node:stream/promises');
 const express = require('express');
 const { Pool } = require('pg');
 const copyFrom = require('pg-copy-streams').from;
-const session = require('express-session');
+const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const csv = require('csv-parser');
@@ -12,27 +12,41 @@ const ExcelJS = require('exceljs');
 const app = express();
 const port = process.env.PORT || 3001;
 
+// JWT Secret - in production, use environment variable
+const JWT_SECRET = process.env.JWT_SECRET || 'fd3985dfjDio@88_jwt_secret';
+
 // Configure multer for file uploads
 const upload = multer({ dest: 'uploads/' });
 
 app.use(express.json());
 
-app.use(session({
-  secret: 'fd3985dfjDio@88',
-  resave: false,
-  saveUninitialized: false,
-  cookie: { secure: false }
-}));
+// JWT Authentication middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
 
-const dbConfig = {
-  user: 'postgres',
-  host: 'localhost',
-  database: 'f1db',
-  password: 'postgres',
-  port: 5432,
+  if (!token) {
+    return res.status(401).json({ message: 'Access token required' });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ message: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  });
 };
 
-app.post('/login', async (req, res) => {
+const dbConfig = {
+  user: process.env.DB_USER || 'postgres',
+  host: process.env.DB_HOST || 'localhost',
+  database: process.env.DB_NAME || 'f1db',
+  password: process.env.DB_PASSWORD || 'postgres',
+  port: process.env.DB_PORT || 5432,
+};
+
+app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
 
   if (!username || !password) {
@@ -60,18 +74,20 @@ app.post('/login', async (req, res) => {
       return res.status(401).json({ message: authResult.message });
     }
 
-    // Store user information in session
-    req.session.user = {
+    // Create JWT token with user information
+    const tokenPayload = {
       userId: authResult.userid,
       username: authResult.login,
       role: authResult.tipo,
-      idOriginal: authResult.idoriginal,
-      dbConfig: dbConfig
+      idOriginal: authResult.idoriginal
     };
+
+    const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '24h' });
     
     console.log(`Login successful. User ${authResult.login} with role ${authResult.tipo} authenticated. Audit record created.`);
     res.json({
       message: authResult.message,
+      token: token,
       user: {
         userId: authResult.userid,
         username: authResult.login,
@@ -82,43 +98,31 @@ app.post('/login', async (req, res) => {
 
   } catch (error) {
     console.error('Login error:', error);
-    if (req.session) {
-      req.session.destroy(err => {
-        if (err) {
-          console.error("Error destroying session during login failure:", err);
-        }
-      });
-    }
     res.status(500).json({ message: 'Login failed due to a server error.' });
   }
 });
 
-app.get('/check-auth', (req, res) => {
-  if (req.session.user) {
-    res.json({ isAuthenticated: true, user: req.session.user });
-  } else {
-    res.json({ isAuthenticated: false });
-  }
-});
-
-app.post('/logout', (req, res) => {
-  req.session.destroy(err => {
-    if (err) {
-      return res.status(500).json({ message: 'Could not log out, please try again.'});
+app.get('/check-auth', authenticateToken, (req, res) => {
+  res.json({ 
+    isAuthenticated: true, 
+    user: {
+      userId: req.user.userId,
+      username: req.user.username,
+      role: req.user.role,
+      idOriginal: req.user.idOriginal
     }
-    res.clearCookie('connect.sid');
-    res.json({ message: 'Logout successful' });
   });
 });
 
-app.get('/api/views', async (req, res) => {
-  console.log('Session data:', req.session);
-  if (!req.session.user || !req.session.user.dbConfig) {
-    return res.status(401).json({ message: 'Unauthorized: No active session or database configuration missing.' });
-  }
-  const userRole = req.session.user.role;
-  console.log('User role from session:', userRole, 'Type:', typeof userRole);
-  const pool = new Pool(req.session.user.dbConfig);
+app.post('/logout', (req, res) => {
+  // With JWT, logout is handled client-side by removing the token
+  res.json({ message: 'Logout successful' });
+});
+
+app.get('/api/views', authenticateToken, async (req, res) => {
+  const userRole = req.user.role;
+  console.log('User role from token:', userRole, 'Type:', typeof userRole);
+  const pool = new Pool(dbConfig);
 
   try {
     const client = await pool.connect();
@@ -158,7 +162,7 @@ app.get('/api/views', async (req, res) => {
         { name: 'Anos na Fórmula 1', query: 'SELECT * FROM AnosEscuderia($1)' }
       ];
 
-      const constructorId = req.session.user.idOriginal;
+      const constructorId = req.user.idOriginal;
       
       for (const view of viewQueries) {
         try {
@@ -184,7 +188,7 @@ app.get('/api/views', async (req, res) => {
         { name: 'Estatísticas gerais', query: 'SELECT * FROM EstatisticasPiloto($1)' }
       ];
 
-      const driverId = req.session.user.idOriginal;
+      const driverId = req.user.idOriginal;
       
       for (const view of viewQueries) {
         try {
@@ -222,13 +226,8 @@ app.get('/api/views', async (req, res) => {
 });
 
 // New endpoint for individual view with pagination
-app.get('/api/view/:viewName', async (req, res) => {
-  console.log('Session data:', req.session);
-  if (!req.session.user || !req.session.user.dbConfig) {
-    return res.status(401).json({ message: 'Unauthorized: No active session or database configuration missing.' });
-  }
-  
-  const userRole = req.session.user.role;
+app.get('/api/view/:viewName', authenticateToken, async (req, res) => {
+  const userRole = req.user.role;
   const { viewName } = req.params;
   const page = parseInt(req.query.page) || 1;
   const limit = parseInt(req.query.limit) || 20;
@@ -309,7 +308,7 @@ app.get('/api/view/:viewName', async (req, res) => {
     return res.status(403).json({ message: 'Access denied: You do not have permission to access this view.' });
   }
   
-  const pool = new Pool(req.session.user.dbConfig);
+  const pool = new Pool(dbConfig);
 
   try {
     const client = await pool.connect();
@@ -318,7 +317,7 @@ app.get('/api/view/:viewName', async (req, res) => {
     const queryParams = [];
     
     if (viewConfig.requiresUserId) {
-      const userId = req.session.user.idOriginal;
+      const userId = req.user.idOriginal;
       queryParams.push(userId);
       
       if (typeof viewConfig.query === 'function') {
@@ -374,13 +373,9 @@ app.get('/api/view/:viewName', async (req, res) => {
 });
 
 // Get user information endpoint
-app.get('/api/user-info', async (req, res) => {
-  if (!req.session.user || !req.session.user.dbConfig) {
-    return res.status(401).json({ message: 'Unauthorized: No active session or database configuration missing.' });
-  }
-
-  const username = req.session.user.username;
-  const pool = new Pool(req.session.user.dbConfig);
+app.get('/api/user-info', authenticateToken, async (req, res) => {
+  const username = req.user.username;
+  const pool = new Pool(dbConfig);
 
   try {
     const client = await pool.connect();
@@ -415,12 +410,8 @@ app.get('/api/user-info', async (req, res) => {
 });
 
 // Insert new driver endpoint
-app.post('/api/drivers', async (req, res) => {
-  if (!req.session.user || !req.session.user.dbConfig) {
-    return res.status(401).json({ message: 'Unauthorized: No active session or database configuration missing.' });
-  }
-
-  const userRole = req.session.user.role;
+app.post('/api/drivers', authenticateToken, async (req, res) => {
+  const userRole = req.user.role;
   if (userRole !== 'admin' && userRole !== 'Administrador') {
     return res.status(403).json({ message: 'Access denied: Only administrators can insert drivers.' });
   }
@@ -431,7 +422,7 @@ app.post('/api/drivers', async (req, res) => {
     return res.status(400).json({ message: 'All fields are required.' });
   }
 
-  const pool = new Pool(req.session.user.dbConfig);
+  const pool = new Pool(dbConfig);
 
   try {
     const client = await pool.connect();
@@ -461,12 +452,8 @@ app.post('/api/drivers', async (req, res) => {
 });
 
 // Insert new constructor endpoint
-app.post('/api/constructors', async (req, res) => {
-  if (!req.session.user || !req.session.user.dbConfig) {
-    return res.status(401).json({ message: 'Unauthorized: No active session or database configuration missing.' });
-  }
-
-  const userRole = req.session.user.role;
+app.post('/api/constructors', authenticateToken, async (req, res) => {
+  const userRole = req.user.role;
   if (userRole !== 'admin' && userRole !== 'Administrador') {
     return res.status(403).json({ message: 'Access denied: Only administrators can insert constructors.' });
   }
@@ -477,7 +464,7 @@ app.post('/api/constructors', async (req, res) => {
     return res.status(400).json({ message: 'All fields are required.' });
   }
 
-  const pool = new Pool(req.session.user.dbConfig);
+  const pool = new Pool(dbConfig);
 
   try {
     const client = await pool.connect();
@@ -507,12 +494,8 @@ app.post('/api/constructors', async (req, res) => {
 });
 
 // Search drivers by surname endpoint
-app.get('/api/search-drivers', async (req, res) => {
-  if (!req.session.user || !req.session.user.dbConfig) {
-    return res.status(401).json({ message: 'Unauthorized: No active session or database configuration missing.' });
-  }
-
-  const userRole = req.session.user.role;
+app.get('/api/search-drivers', authenticateToken, async (req, res) => {
+  const userRole = req.user.role;
   if (userRole !== 'escuderia' && userRole !== 'Escuderia') {
     return res.status(403).json({ message: 'Access denied: Only constructor users can search drivers.' });
   }
@@ -524,13 +507,13 @@ app.get('/api/search-drivers', async (req, res) => {
   }
 
   // Extract constructorref from user's login by removing '_c' suffix
-  const userLogin = req.session.user.username;
-  const constructorId = req.session.user.idOriginal;
+  const userLogin = req.user.username;
+  const constructorId = req.user.idOriginal;
   const constructorRef = userLogin.endsWith('_c') ? userLogin.slice(0, -2) : userLogin;
   
   console.log(`Searching drivers for constructor: ${constructorRef}, surname: ${surname}`);
 
-  const pool = new Pool(req.session.user.dbConfig);
+  const pool = new Pool(dbConfig);
 
   try {
     const client = await pool.connect();
@@ -569,12 +552,8 @@ app.get('/api/search-drivers', async (req, res) => {
 });
 
 // Upload drivers file endpoint
-app.post('/api/upload-drivers', upload.single('file'), async (req, res) => {
-  if (!req.session.user || !req.session.user.dbConfig) {
-    return res.status(401).json({ message: 'Unauthorized: No active session or database configuration missing.' });
-  }
-
-  const userRole = req.session.user.role;
+app.post('/api/upload-drivers', upload.single('file'), authenticateToken, async (req, res) => {
+  const userRole = req.user.role;
   if (userRole !== 'escuderia' && userRole !== 'Escuderia') {
     return res.status(403).json({ message: 'Access denied: Only constructor users can upload driver files.' });
   }
@@ -583,7 +562,7 @@ app.post('/api/upload-drivers', upload.single('file'), async (req, res) => {
     return res.status(400).json({ message: 'No file uploaded.' });
   }
 
-  const pool = new Pool(req.session.user.dbConfig);
+  const pool = new Pool(dbConfig);
   let insertedCount = 0;
   let errors = [];
 
@@ -661,12 +640,8 @@ app.post('/api/upload-drivers', upload.single('file'), async (req, res) => {
 });
 
 // Reports endpoints
-app.get('/api/reports', async (req, res) => {
-  if (!req.session.user || !req.session.user.dbConfig) {
-    return res.status(401).json({ message: 'Unauthorized: No active session or database configuration missing.' });
-  }
-  
-  const userRole = req.session.user.role;
+app.get('/api/reports', authenticateToken, async (req, res) => {
+  const userRole = req.user.role;
   let reports = [];
   
   if (userRole === 'admin' || userRole === 'Administrador') {
@@ -772,14 +747,10 @@ app.get('/api/reports', async (req, res) => {
   });
 });
 
-app.post('/api/reports/execute', async (req, res) => {
-  if (!req.session.user || !req.session.user.dbConfig) {
-    return res.status(401).json({ message: 'Unauthorized: No active session or database configuration missing.' });
-  }
-  
+app.post('/api/reports/execute', authenticateToken, async (req, res) => {
   const { reportId, params } = req.body;
-  const userRole = req.session.user.role;
-  const pool = new Pool(req.session.user.dbConfig);
+  const userRole = req.user.role;
+  const pool = new Pool(dbConfig);
   
   try {
     const client = await pool.connect();
@@ -892,7 +863,7 @@ app.post('/api/reports/execute', async (req, res) => {
       result = await client.query(query);
       
     } else if (userRole === 'escuderia' || userRole === 'Escuderia') {
-      const constructorId = req.session.user.idOriginal;
+      const constructorId = req.user.idOriginal;
       
       if (reportId === 'report4') {
         result = await client.query('SELECT * FROM PilotosVitoriasEscuderia($1)', [constructorId]);
@@ -903,7 +874,7 @@ app.post('/api/reports/execute', async (req, res) => {
       }
       
     } else if (userRole === 'piloto' || userRole === 'Piloto') {
-      const driverId = req.session.user.idOriginal;
+      const driverId = req.user.idOriginal;
       
       if (reportId === 'report6') {
         result = await client.query('SELECT * FROM PontosPiloto($1)', [driverId]);

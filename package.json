@@ -16,7 +16,7 @@
     "csv-parser": "^3.2.0",
     "exceljs": "^4.4.0",
     "express": "^5.1.0",
-    "express-session": "^1.18.1",
+    "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.0",
     "pg": "^8.16.0",
     "pg-copy-streams": "^7.0.0"
