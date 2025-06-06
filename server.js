@@ -3,11 +3,8 @@ const express = require('express');
 const { Pool } = require('pg');
 const copyFrom = require('pg-copy-streams').from;
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
 const multer = require('multer');
-const csv = require('csv-parser');
 const fs = require('fs');
-const ExcelJS = require('exceljs');
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -44,6 +41,7 @@ const dbConfig = {
   database: process.env.DB_NAME || 'f1db',
   password: process.env.DB_PASSWORD || 'postgres',
   port: process.env.DB_PORT || 5432,
+  options: '-c timezone=America/Sao_Paulo'
 };
 
 app.post('/api/login', async (req, res) => {
