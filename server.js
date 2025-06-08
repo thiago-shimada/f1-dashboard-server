@@ -758,98 +758,22 @@ app.post('/api/reports/execute', authenticateToken, async (req, res) => {
     if (userRole === 'admin' || userRole === 'Administrador') {
       const adminReports = {
         'report1': `
-          SELECT
-              s.status,
-              COALESCE(r.quantidade, 0) AS quantidade
-          FROM
-              status s
-          LEFT JOIN (
-              SELECT statusid, COUNT(DISTINCT resultid) AS quantidade
-              FROM results
-              GROUP BY statusid
-          ) r ON s.statusid = r.statusid
-          ORDER BY 2 DESC;
+          SELECT * FROM report1;
         `,
         'report2': `
-          SELECT 
-              c.name AS cidade,
-              a.name AS aeroporto,
-              a.city AS cidade_aeroporto,
-              earth_distance(
-                  ll_to_earth(a.latdeg, a.longdeg),
-                  ll_to_earth(c.lat, c.long)
-              ) / 1000 AS distancia,
-              a.type AS tipo
-          FROM airports a
-          JOIN geocities15k c
-            ON earth_box(ll_to_earth(a.latdeg, a.longdeg), 100000) @> ll_to_earth(c.lat, c.long)
-               AND earth_distance(
-                   ll_to_earth(a.latdeg, a.longdeg),
-                   ll_to_earth(c.lat, c.long)
-               ) <= 100000
-          WHERE
-            a.type IN ('medium_airport', 'large_airport')
-            AND a.isocountry = 'BR'
-          ORDER BY 2, 4;
+          SELECT * FROM report2;
         `,
         'report3a': `
-          WITH counter AS (
-              SELECT 
-                  constructorid,
-                  COUNT(DISTINCT driverid) as driver_count
-              FROM results
-              GROUP BY constructorid
-          )
-          SELECT 
-              c.name AS Escuderia,
-              COALESCE(co.driver_count, 0) as Pilotos
-          FROM constructors c
-          LEFT JOIN counter co ON c.constructorid = co.constructorid
-          ORDER BY 2 DESC, 1;
+          SELECT * FROM report3a;
         `,
         'report3b': `
-          SELECT 
-              c.name AS escuderia,
-              COALESCE(corridas.corrida, 0) as corridas
-          FROM constructors c
-          LEFT JOIN (
-              SELECT 
-                  constructorid,
-                  COUNT(DISTINCT raceid) as corrida
-              FROM results
-              GROUP BY constructorid
-          ) corridas ON c.constructorid = corridas.constructorid
-          ORDER BY 2 DESC, 1;
+          SELECT * FROM report3b;
         `,
         'report3c': `
-          SELECT 
-            c.name AS escuderia, 
-            c2.name AS circuito, 
-            COUNT(DISTINCT r.raceid) AS quantidade_corridas, 
-            MIN(r.laps) AS minimo_voltas, 
-            MAX(r.laps) AS maximo_voltas, 
-            ROUND(AVG(r.laps), 2) AS media_voltas
-          FROM constructors c 
-          JOIN results r ON r.constructorid = c.constructorid
-          JOIN races r2 ON r2.raceid = r.raceid 
-          JOIN circuits c2 ON c2.circuitid = r2.circuitid
-          GROUP BY 1, 2
-          ORDER BY 1, 3 DESC;
+          SELECT * FROM report3c;
         `,
         'report3d': `
-          SELECT
-            c.name AS escuderia,
-            c2.name AS circuito,
-            r2.year AS ano,
-            SUM(r.laps) AS total_voltas,
-            (SUM(r.milliseconds)||' milliseconds')::INTERVAL AS total_tempo
-          FROM constructors c
-          JOIN results r ON r.constructorid = c.constructorid
-          JOIN races r2 ON r2.raceid = r.raceid
-          JOIN circuits c2 ON c2.circuitid = r2.circuitid
-          WHERE r.milliseconds IS NOT NULL
-          GROUP BY 1, 2, 3
-          ORDER BY 1, 2, 3;
+          SELECT * FROM report3d;
         `
       };
       
